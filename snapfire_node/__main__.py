@@ -17,7 +17,11 @@ Env:
                    (replaces TEXT_MODEL and PRICE_PER_1K)
 
   COMFY_URL        local ComfyUI server, e.g. http://localhost:8188; unset to serve no ComfyUI work
-  COMFY_PRICE      micro-dollars per megapixel-step   (40)
+  COMFY_PRICE      your floor, in micro-dollars per megapixel-step: no image work below it.
+                   Unset (the usual): worked out from what your GPU's electricity costs per unit,
+                   measured on the jobs it runs. Everyone is paid Snapfire's market price.
+  GPU_WATTS        your GPU's power draw, for that floor (read from nvidia-smi; 60 on a Mac)
+  KWH_PRICE        what your electricity costs, in dollars per kWh   (0.15)
   COMFY_MODELS     only offer these checkpoint/diffusion-model files, comma separated (default: all)
   GPU_NEED_MB      share the GPU: take no work while other programs leave less than this much VRAM (0: off)
 
@@ -42,7 +46,9 @@ import json
 import logging
 import os
 import re
+import math
 import shutil
+import subprocess
 import tempfile
 import time
 import uuid
@@ -66,7 +72,11 @@ LLM_MODELS = {m.strip(): int(p) for m, p in
     or ({MODEL: PRICE} if OLLAMA else {})
 
 COMFY = os.environ.get("COMFY_URL", "")
-COMFY_PRICE = int(os.environ.get("COMFY_PRICE", "40"))
+# The floor for image work: a fixed one if the owner set COMFY_PRICE, otherwise learned (see Floors).
+COMFY_PRICE_SET = os.environ.get("COMFY_PRICE", "").strip()
+COMFY_PRICE = int(COMFY_PRICE_SET) if COMFY_PRICE_SET else 10  # before anything is measured: a quarter of the starting price
+KWH_PRICE = float(os.environ.get("KWH_PRICE", "0.15"))
+FLOOR_MARGIN = 1.25
 GPU_NEED_MB = int(os.environ.get("GPU_NEED_MB", "0"))
 OOM_RETRIES = 3
 COMFY_ONLY = {m.strip() for m in os.environ.get("COMFY_MODELS", "").split(",") if m.strip()}
@@ -433,6 +443,52 @@ async def run_tool(broker: httpx.AsyncClient, task: dict) -> dict:
 
 # ---- the loop ---------------------------------------------------------------
 
+def gpu_watts() -> float:
+    """The GPU's power limit, for working out what a unit of work costs in electricity."""
+    if os.environ.get("GPU_WATTS"):
+        return float(os.environ["GPU_WATTS"])
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=power.limit", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10).stdout.split()
+        return float(out[0])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return 60.0  # a Mac, or no nvidia-smi
+
+
+class Floors:
+    """The lowest price this node takes image work at, per model: what the electricity for one unit
+    costs (watts x seconds per unit, at KWH_PRICE), plus a margin. Learned from the jobs it runs,
+    so nobody has to guess a price. An owner who sets COMFY_PRICE gets that instead."""
+
+    def __init__(self):
+        self.watts = gpu_watts()
+        self.sec_per_unit: dict[str, float] = {}
+        self.learned: dict[str, int] = {}
+
+    def floor(self, model: str) -> int:
+        return self.learned.get(model, COMFY_PRICE)
+
+    def learn(self, model: str, units: float, seconds: float) -> bool:
+        """Record a finished run; True if the floor moved enough to tell the broker."""
+        if COMFY_PRICE_SET or units <= 0 or seconds <= 0 or model not in MODELS:
+            return False
+        s = seconds / units
+        old = self.sec_per_unit.get(model)
+        self.sec_per_unit[model] = s if old is None else 0.7 * old + 0.3 * s
+        dollars = self.watts * self.sec_per_unit[model] / 3_600_000 * KWH_PRICE  # W*s -> kWh -> $
+        floor = max(1, math.ceil(dollars * 1_000_000 * FLOOR_MARGIN))
+        before = MODELS[model]
+        if abs(floor - before) <= max(1, before * 0.2):
+            return False
+        MODELS[model] = self.learned[model] = floor
+        log.info("floor for %s is now %d micro-dollars per unit (%.2f s per unit at %d W)",
+                 model, floor, self.sec_per_unit[model], self.watts)
+        return True
+
+
+FLOORS: Floors | None = None
+
+
 async def worker(broker: httpx.AsyncClient, ollama: httpx.AsyncClient | None, comfy: httpx.AsyncClient | None,
                  n: int) -> None:
     while True:
@@ -453,7 +509,11 @@ async def worker(broker: httpx.AsyncClient, ollama: httpx.AsyncClient | None, co
                 if kind == "comfyui":
                     if not comfy:
                         raise RuntimeError("this provider has no ComfyUI")
+                    started = time.monotonic()
                     result = await run_comfy(comfy, broker, task)
+                    if FLOORS and "error" not in result and FLOORS.learn(task["model"], float(task.get("units") or 0),
+                                                                          time.monotonic() - started):
+                        await register(broker, quiet=True)
                 elif kind == "tool":
                     result = await run_tool(broker, task)
                 else:
@@ -530,6 +590,8 @@ async def main() -> None:
                 for name in NODE_TOOLS:
                     MODELS[f"tool:{name}"] = TOOL_PRICE
         if comfy:
+            global FLOORS
+            FLOORS = Floors()
             await load_comfy(comfy, broker)
         await register(broker)
         background = [asyncio.create_task(keep_fresh(comfy, broker))] if comfy else []
@@ -555,8 +617,8 @@ async def load_comfy(comfy: httpx.AsyncClient, broker: httpx.AsyncClient) -> Non
         del MODELS[k]
     for ckpt in await comfy_checkpoints(comfy):
         if not (COMFY_ONLY or PRESETS) or ckpt in allowed:
-            MODELS[f"comfyui:{ckpt}"] = COMFY_PRICE
-    MODELS["comfyui"] = COMFY_PRICE  # workflows that load no checkpoint
+            MODELS[f"comfyui:{ckpt}"] = FLOORS.floor(f"comfyui:{ckpt}") if FLOORS else COMFY_PRICE
+    MODELS["comfyui"] = FLOORS.floor("comfyui") if FLOORS else COMFY_PRICE  # workflows that load no checkpoint
     NODE["files"] = files if REPORT_FILES == "all" else files & (preset_files | allowed)
     NODE["vram_mb"] = vram
 

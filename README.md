@@ -7,9 +7,12 @@ per task. One command sets it up:
 curl -fsSL https://snapfire.studio/install.sh | bash
 ```
 
-It downloads this folder to `~/snapfire-node` and runs `setup.sh`, which asks what
-to serve, writes `.env`, starts the node in Docker and waits until the broker
-lists it. Run `./setup.sh` again any time to change your answers.
+It downloads this folder to `~/snapfire-node` and runs `setup.sh`, which works
+everything out from the machine (no questions): on an NVIDIA GPU, ComfyUI runs in
+Docker and the node serves every preset that fits in its GPU memory; on a Mac,
+ComfyUI Desktop runs on the Mac itself (Docker can't use the Mac's GPU) and the
+node serves the lighter presets. It downloads the models, writes `.env`, starts
+the node and waits until Snapfire lists it. The node gets a random name.
 
 To tie the node to your account, sign in on the broker's **Run a node** page
 and copy the command it makes there. It carries a one-time `JOIN_CODE`, so the
@@ -45,10 +48,16 @@ spend on jobs. Without one, the node gets an account of its own.
 
 ## Getting paid
 
-You set the price in `.env`: `COMFY_PRICE` per megapixel-step (sampler steps x
-megapixels x batch size) and `PRICE_PER_1K` per 1,000 tokens. Tasks go to the
-cheapest free node that can run them, and each node is paid its own price,
-minus the broker's fee. Image tasks pay a price fixed before they run.
+Snapfire sets one market price per model, per megapixel-step for image work
+(sampler steps x megapixels x frames x batch size). Customers pay it and every
+node is paid it, minus the platform fee. Image tasks pay a price fixed before
+they run.
+
+You don't set a price. The node works out its **floor**, the lowest price it takes
+work at, from what the electricity for one unit costs on your GPU (power draw x
+seconds per unit, measured on the jobs it runs, at `KWH_PRICE`, 0.15 $/kWh by
+default, plus 25%). It only gets work while the market price is at or above that.
+To use a fixed floor instead, set `COMFY_PRICE` in `.env`.
 
 ```bash
 # earnings so far, in micro-dollars

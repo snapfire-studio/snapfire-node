@@ -1,22 +1,17 @@
 #!/usr/bin/env bash
-# Snapfire node setup. Asks a few questions, writes .env, starts the node in Docker
-# and waits until the broker lists it.
+# Snapfire node setup. Looks at the machine, writes .env, starts the node in Docker and waits
+# until Snapfire lists it. It asks nothing it can work out itself.
 #
-# Run it again any time to change answers; your provider key is kept.
-# To skip the questions, set them in the environment and pass ASSUME_YES=1:
-#   SNAPFIRE_BROKER   broker address                      (asked, or read from broker.url)
-#   NODE_NAME     name shown in the market            (this machine's hostname)
-#   SERVE         images | text | both
-#   COMFY_MODE    host | docker    where ComfyUI runs (host = already running on this machine)
-#   OLLAMA_MODE   host | docker    where Ollama runs
-#   COMFY_PRICE   micro-dollars per megapixel-step    (40)
-#   TEXT_PRICE    micro-dollars per 1k tokens         (200)
-#   PRESETS       presets to serve, comma separated, or all  (the broker lists them)
-#   FETCH_MODELS  yes | no         let the node download the models those presets need
-#   DISK_BUDGET_GB  most disk for downloaded models (100)
+# Run it again any time; the node's account and name are kept.
+# Everything is worked out from the machine. To override, set these in the environment:
+#   SNAPFIRE_BROKER  Snapfire address              (read from broker.url, written by install.sh)
+#   COMFY_MODE    host | docker   where ComfyUI runs (Mac: host, NVIDIA: docker)
+#   PRESETS       presets to serve, comma separated, or all   (NVIDIA: all; Mac: the light ones)
 #   MODELS_DIR    ComfyUI's models folder (./models when ComfyUI runs in Docker)
-#   JOIN_CODE     one-time code from the broker's "Run a node" page: the node's earnings go
-#                 to your signed-in account. Without one the node gets an account of its own.
+#   FETCH_MODELS  yes | no        let the node download the models those presets need (yes)
+#   DISK_BUDGET_GB  most disk for downloaded models (100)
+#   SERVE         images | text | both   (images)
+#   JOIN_CODE     one-time code from the Run a node page: the node's earnings go to your account.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -67,82 +62,70 @@ esac
 
 # ---- 2. the broker ----------------------------------------------------------
 [ -f .env ] && PROVIDER_KEY="${PROVIDER_KEY:-$(grep '^PROVIDER_KEY=' .env | cut -d= -f2- || true)}"
+[ -f .env ] && NODE_NAME="${NODE_NAME:-$(grep '^PROVIDER_NAME=' .env | cut -d= -f2- || true)}"
 [ -z "${SNAPFIRE_BROKER:-}" ] && [ -f broker.url ] && SNAPFIRE_BROKER="$(cat broker.url)"
-ask SNAPFIRE_BROKER "Broker address" "http://localhost:8400"
+ask SNAPFIRE_BROKER "Snapfire address" "https://snapfire.studio"
 SNAPFIRE_BROKER="${SNAPFIRE_BROKER%/}"
-HEALTH="$(curl -fsS -m 10 "$SNAPFIRE_BROKER/health" 2> /dev/null)" || die "Can't reach a Snapfire broker at $SNAPFIRE_BROKER."
+HEALTH="$(curl -fsS -m 10 "$SNAPFIRE_BROKER/health" 2> /dev/null)" || die "Can't reach Snapfire at $SNAPFIRE_BROKER."
 POOL_MODEL="$(printf '%s' "$HEALTH" | json pool_model)"
-say "Broker: $SNAPFIRE_BROKER (pool $(printf '%s' "$HEALTH" | json pool), text model $POOL_MODEL)"
 
-ask NODE_NAME "Name for this node, shown in the market" "$(hostname -s 2> /dev/null || echo node)"
+# The market shows a generated name, not one people pick (it would be shown to strangers).
+if [ -z "${NODE_NAME:-}" ]; then
+  NODE_NAME="node-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
+fi
 NODE_NAME="$(printf '%s' "$NODE_NAME" | tr -cd 'A-Za-z0-9._-' | cut -c1-40)"
-[ -n "$NODE_NAME" ] || die "The node needs a name."
 
-# ---- 3. what to serve -------------------------------------------------------
-bold "What should this node serve?"
-say "  images  ComfyUI workflows, paid per megapixel-step"
-say "  text    LLM requests on $POOL_MODEL, paid per 1k tokens"
-DEFAULT_SERVE=text
-if [ "$HOST_COMFY" = yes ] || [ "$GPU" = nvidia ]; then DEFAULT_SERVE=images; fi
-if { [ "$HOST_COMFY" = yes ] && [ "$HOST_OLLAMA" = yes ]; } || [ "$GPU" = nvidia ]; then DEFAULT_SERVE=both; fi
-ask SERVE "Serve images, text or both" "$DEFAULT_SERVE"
-case "$SERVE" in images|text|both) ;; *) die "Answer images, text or both." ;; esac
-
+# ---- 3. how it runs: decided from the machine, no questions ------------------
+# Images only: the presets are image, video and 3D work. (SERVE=text|both still works for the text pool.)
+SERVE="${SERVE:-images}"
 PROFILES=""; COMFY_URL=""; OLLAMA_URL=""; COMFY_ARGS=""; TORCH_INDEX=""
 if [ "$SERVE" != text ]; then
-  if [ "$HOST_COMFY" = yes ]; then DEF=host; else DEF=docker; fi
-  if [ "$DEF" = docker ] && [ "$GPU" != nvidia ]; then
-    say "ComfyUI in Docker would run on the CPU here: a minute or more per image. It works, but earns little."
+  if [ -z "${COMFY_MODE:-}" ]; then
+    if [ "$OS" = Darwin ]; then
+      # Docker on a Mac can't reach the Mac's GPU, so ComfyUI has to run on the Mac itself.
+      [ "$HOST_COMFY" = yes ] || die "On a Mac, ComfyUI runs outside Docker so it can use the GPU.
+       Install ComfyUI Desktop from https://www.comfy.org/download, open it, then run this again."
+      COMFY_MODE=host
+    elif [ "$GPU" = nvidia ]; then
+      COMFY_MODE=docker
+    else
+      die "This machine has no GPU that Docker can use. A node needs an NVIDIA GPU (Linux or Windows with WSL)
+       with the NVIDIA Container Toolkit, or an Apple Silicon Mac running ComfyUI Desktop."
+    fi
   fi
-  ask COMFY_MODE "Run ComfyUI on this machine itself (host) or in Docker (docker)" "$DEF"
   if [ "$COMFY_MODE" = host ]; then
     COMFY_URL="http://host.docker.internal:8188"
   else
     COMFY_URL="http://comfyui:8188"; PROFILES="comfyui"
-    if [ "$GPU" != nvidia ]; then COMFY_ARGS="--cpu"; TORCH_INDEX="https://download.pytorch.org/whl/cpu"; fi
   fi
-  ask COMFY_PRICE "Your price for image work, in micro-dollars per megapixel-step" "40"
 fi
 if [ "$SERVE" != images ]; then
-  if [ "$HOST_OLLAMA" = yes ]; then DEF=host; else DEF=docker; fi
-  ask OLLAMA_MODE "Run Ollama on this machine itself (host) or in Docker (docker)" "$DEF"
-  if [ "$OLLAMA_MODE" = host ]; then
-    OLLAMA_URL="http://host.docker.internal:11434"
-  else
-    OLLAMA_URL="http://ollama:11434"; PROFILES="${PROFILES:+$PROFILES,}ollama"
-  fi
-  ask TEXT_PRICE "Your price for text work, in micro-dollars per 1k tokens" "200"
-  say "Ollama will download $POOL_MODEL the first time, if it doesn't have it yet."
+  if [ "$HOST_OLLAMA" = yes ]; then OLLAMA_MODE="${OLLAMA_MODE:-host}"; else OLLAMA_MODE="${OLLAMA_MODE:-docker}"; fi
+  if [ "$OLLAMA_MODE" = host ]; then OLLAMA_URL="http://host.docker.internal:11434"
+  else OLLAMA_URL="http://ollama:11434"; PROFILES="${PROFILES:+$PROFILES,}ollama"; fi
 fi
+# Prices are Snapfire's standard rates: nodes don't set their own.
 
 # ---- 4. presets and their models -------------------------------------------
+# A node serves every preset its GPU has room for (the worker checks each one's memory need)
+# and downloads the models itself, checked against Snapfire's checksums.
 MODELS_DIR="${MODELS_DIR:-}"
-PRESETS="${PRESETS:-}"; FETCH="no"; BLENDER_SETTING=""
+FETCH="no"; BLENDER_SETTING=""
 if [ "$SERVE" != text ]; then
-  bold "Presets"
-  say "Presets are tested workflows customers pick from a form. Choose the ones this node serves;"
-  say "it can download their models itself (checked against the broker's checksums)."
-  say ""
-  curl -fsS -m 10 "$SNAPFIRE_BROKER/presets.txt" 2> /dev/null | sed 's/^/  /' || say "  (couldn't list them)"
-  say ""
-  DEF_PRESETS=quick-image
-  [ "$GPU" = nvidia ] && DEF_PRESETS=all
-  ask PRESETS "Presets to serve, comma separated, or all" "$DEF_PRESETS"
-  if [ "${COMFY_MODE:-}" = host ]; then
-    DEF_DIR=""
-    for d in "$HOME/ComfyUI/models" "$HOME/comfyui/models" "$HOME/Documents/ComfyUI/models"; do
-      [ -d "$d" ] && { DEF_DIR="$d"; break; }
+  if [ "$COMFY_MODE" = host ]; then
+    for d in "$HOME/Documents/ComfyUI/models" "$HOME/ComfyUI/models" "$HOME/comfyui/models"; do
+      [ -z "$MODELS_DIR" ] && [ -d "$d" ] && MODELS_DIR="$d"
     done
-    ask MODELS_DIR "Your ComfyUI's models folder (empty: I'll add models myself)" "$DEF_DIR"
+    ask MODELS_DIR "Couldn't find ComfyUI's models folder. Where is it?" ""
+    # a Mac runs the lighter presets; the big video models need an NVIDIA card
+    PRESETS="${PRESETS:-quick-image,remove-background,upscale}"
   else
     MODELS_DIR="${MODELS_DIR:-./models}"
+    PRESETS="${PRESETS:-all}"
   fi
-  if [ -n "$MODELS_DIR" ]; then
-    mkdir -p "$MODELS_DIR"
-    ask FETCH_MODELS "Download the models these presets need (now and when they change)? yes or no" "yes"
-    case "$FETCH_MODELS" in y|yes) FETCH=yes ;; esac
-    [ "$FETCH" = yes ] && ask DISK_BUDGET_GB "Most disk to use for downloaded models, in GB" "100"
-  fi
+  [ -n "$MODELS_DIR" ] || die "ComfyUI's models folder is needed so the node can add the models it serves."
+  mkdir -p "$MODELS_DIR"
+  case "${FETCH_MODELS:-yes}" in y|yes|1) FETCH=yes ;; esac
   case ",$PRESETS," in *,all,*|*,character-3d,*) BLENDER_SETTING=auto ;; esac
 fi
 
@@ -183,7 +166,8 @@ PRICE_PER_1K=${TEXT_PRICE:-200}
 
 # image work (empty COMFY_URL = none)
 COMFY_URL=$COMFY_URL
-COMFY_PRICE=${COMFY_PRICE:-40}
+# your floor for image work (empty: worked out from your GPU's electricity cost; you are paid the market price)
+COMFY_PRICE=${COMFY_PRICE:-}
 COMFY_ARGS=$COMFY_ARGS
 TORCH_INDEX=$TORCH_INDEX
 MODELS_DIR=${MODELS_DIR:-./models}
@@ -207,7 +191,7 @@ docker compose up -d --remove-orphans
 
 # The worker logs "registered <name>" once the broker has accepted it. Reading its own log,
 # not the market list, means a leftover entry from an earlier run can't pass for this one.
-printf 'Waiting for %s to join the pool' "$NODE_NAME"
+printf 'Waiting for the node to join'
 ONLINE=no
 for _ in $(seq 1 180); do
   if docker compose logs worker 2> /dev/null | grep -q "registered $NODE_NAME "; then ONLINE=yes; break; fi
@@ -216,16 +200,15 @@ done
 echo
 
 if [ "$ONLINE" = yes ]; then
-  bold "$NODE_NAME is online and taking work."
+  bold "Your node is online and taking work."
 else
-  bold "$NODE_NAME has not joined yet."
+  bold "Your node has not joined yet."
   say "It may still be building. Check with:  docker compose logs -f worker"
 fi
 say ""
-[ "$FETCH" = yes ] && say "Models for $PRESETS download in the background; the log shows progress."
+[ "$FETCH" = yes ] && say "The models download in the background; the log shows progress."
 say "  Watch it work      docker compose logs -f worker"
 say "  See your earnings  curl -s -H \"Authorization: Bearer \$(grep ^PROVIDER_KEY= .env | cut -d= -f2)\" $SNAPFIRE_BROKER/accounts/me"
-say "  Change prices      edit .env, then: docker compose up -d"
 say "  Stop the node      docker compose down"
 say "  This folder        $(pwd)"
 [ "$ONLINE" = yes ] || exit 1
