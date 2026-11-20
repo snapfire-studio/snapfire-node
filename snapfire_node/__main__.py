@@ -635,8 +635,14 @@ async def load_comfy(comfy: httpx.AsyncClient, broker: httpx.AsyncClient) -> Non
     allowed, preset_files = set(COMFY_ONLY), set()
     if PRESETS:
         try:
-            ps = prepare.wanted((await broker.get("/presets")).json()["presets"], PRESETS)
-        except (httpx.HTTPError, KeyError, ValueError):
+            r = await broker.get("/presets")
+            r.raise_for_status()
+            ps = prepare.wanted(r.json()["presets"], PRESETS)
+        except (httpx.HTTPError, KeyError, ValueError) as e:
+            # the broker is restarting or unreachable: keep offering what we offered, rather than nothing
+            if any(k.startswith("comfyui:") for k in MODELS):
+                log.warning("couldn't read the presets (%s): keeping the models already offered", e)
+                return
             ps = []
         preset_files = {f for p in ps for f in p["needs"]["files"]}
         if not COMFY_ONLY:
