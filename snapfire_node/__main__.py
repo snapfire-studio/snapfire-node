@@ -96,6 +96,8 @@ DISK_BUDGET_GB = float(os.environ.get("DISK_BUDGET_GB", "100"))
 BLENDER_HOME = os.path.expanduser(os.environ.get("TOOLS_DIR", "~/.snapfire-tools"))  # where BLENDER=auto puts it
 REPORT_FILES = os.environ.get("REPORT_FILES", "presets" if PRESETS else "all")
 NODE = {"files": None, "vram_mb": None, "gpu": None}  # what this node has, as last reported
+# new on every start: tells the broker this is a new process, so tasks handed to the old one go back in the queue
+BOOT = uuid.uuid4().hex[:8]
 TOOL_PRICE = int(os.environ.get("TOOL_PRICE", "2000"))
 SCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools")  # the Blender scripts this node ships
 TOOL_TIMEOUT = 600
@@ -201,6 +203,19 @@ async def run_comfy(comfy: httpx.AsyncClient, broker: httpx.AsyncClient, task: d
                                       files={"image": (name, src.content, src.headers.get("content-type", "image/png"))})
                 up.raise_for_status()
                 node["inputs"][key] = up.json()["name"]
+
+    # A different model than last time: unload the old ones first. ComfyUI keeps models in RAM after a
+    # run, and big ones back to back (an image-edit model, then a video model) can run the machine out of
+    # memory, which kills ComfyUI mid-job.
+    model = task.get("model") or ""
+    if LAST_MODEL["name"] and model != LAST_MODEL["name"]:
+        await report(0.01, "Making room for the model", now=True)
+        try:
+            await comfy.post("/free", json={"unload_models": True, "free_memory": True})
+            await asyncio.sleep(2)
+        except httpx.HTTPError:
+            pass
+    LAST_MODEL["name"] = model
 
     for attempt in range(OOM_RETRIES + 1):
         try:
@@ -312,6 +327,7 @@ async def gpu_room(comfy: httpx.AsyncClient) -> int | None:
 
 
 GPU_STATE = {"paused": False, "checked": 0.0}
+LAST_MODEL = {"name": ""}  # the model of the last ComfyUI run, to unload it when the next run needs another
 
 
 async def gpu_free_enough(comfy: httpx.AsyncClient) -> bool:
@@ -554,7 +570,7 @@ async def worker(broker: httpx.AsyncClient, ollama: httpx.AsyncClient | None, co
 async def register(broker: httpx.AsyncClient, quiet: bool = False) -> None:
     paused = [m for m in MODELS if m.startswith("comfyui")] if GPU_STATE["paused"] else []
     free = shutil.disk_usage(COMFY_MODELS_DIR).free // 2 ** 20 if os.path.isdir(COMFY_MODELS_DIR) else None
-    info = {"presets": sorted(PRESETS), "fetches_models": FETCH_MODELS, "disk_free_mb": free,
+    info = {"presets": sorted(PRESETS), "fetches_models": FETCH_MODELS, "disk_free_mb": free, "boot": BOOT,
             # for the broker's starting floor on this card, until the node has timed its own jobs
             "gpu": NODE["gpu"], "watts": measured_watts(), "kwh_price": KWH_PRICE, "price_set": bool(COMFY_PRICE_SET),
             "learned": sorted(FLOORS.learned) if FLOORS else []}
