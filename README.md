@@ -57,6 +57,9 @@ You don't set a price. The node works out its **floor**, the lowest price it tak
 work at, from what the electricity for one unit costs on your GPU (power draw x
 seconds per unit, measured on the jobs it runs, at `KWH_PRICE`, 0.15 $/kWh by
 default, plus 25%). It only gets work while the market price is at or above that.
+Until it has timed its own jobs, it starts from your card's typical speed and power
+draw: the node reports the card's name (from ComfyUI or `nvidia-smi`; on a Mac set
+`GPU_NAME`, e.g. `Apple M4 Pro`, which `setup.sh` does for you).
 To use a fixed floor instead, set `COMFY_PRICE` in `.env`.
 
 ```bash

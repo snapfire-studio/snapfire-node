@@ -168,6 +168,10 @@ PRICE_PER_1K=${TEXT_PRICE:-200}
 COMFY_URL=$COMFY_URL
 # your floor for image work (empty: worked out from your GPU's electricity cost; you are paid the market price)
 COMFY_PRICE=${COMFY_PRICE:-}
+# what you pay for electricity, in dollars per kWh (for that floor)
+KWH_PRICE=${KWH_PRICE:-0.15}
+# your graphics card, when ComfyUI can't tell (a Mac's chip)
+GPU_NAME=${GPU_NAME:-$([ "$OS" = Darwin ] && sysctl -n machdep.cpu.brand_string 2> /dev/null || true)}
 COMFY_ARGS=$COMFY_ARGS
 TORCH_INDEX=$TORCH_INDEX
 MODELS_DIR=${MODELS_DIR:-./models}

@@ -22,6 +22,7 @@ Env:
                    measured on the jobs it runs. Everyone is paid Snapfire's market price.
   GPU_WATTS        your GPU's power draw, for that floor (read from nvidia-smi; 60 on a Mac)
   KWH_PRICE        what your electricity costs, in dollars per kWh   (0.15)
+  GPU_NAME         your graphics card, if ComfyUI can't tell (a Mac's chip, e.g. "Apple M4 Pro")
   COMFY_MODELS     only offer these checkpoint/diffusion-model files, comma separated (default: all)
   GPU_NEED_MB      share the GPU: take no work while other programs leave less than this much VRAM (0: off)
 
@@ -94,7 +95,7 @@ COMFY_MODELS_DIR = os.environ.get("COMFY_MODELS_DIR", "")
 DISK_BUDGET_GB = float(os.environ.get("DISK_BUDGET_GB", "100"))
 BLENDER_HOME = os.path.expanduser(os.environ.get("TOOLS_DIR", "~/.snapfire-tools"))  # where BLENDER=auto puts it
 REPORT_FILES = os.environ.get("REPORT_FILES", "presets" if PRESETS else "all")
-NODE = {"files": None, "vram_mb": None}  # what this node has, as last reported
+NODE = {"files": None, "vram_mb": None, "gpu": None}  # what this node has, as last reported
 TOOL_PRICE = int(os.environ.get("TOOL_PRICE", "2000"))
 SCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools")  # the Blender scripts this node ships
 TOOL_TIMEOUT = 600
@@ -443,8 +444,8 @@ async def run_tool(broker: httpx.AsyncClient, task: dict) -> dict:
 
 # ---- the loop ---------------------------------------------------------------
 
-def gpu_watts() -> float:
-    """The GPU's power limit, for working out what a unit of work costs in electricity."""
+def measured_watts() -> float | None:
+    """The GPU's power limit (GPU_WATTS, or nvidia-smi), or None when there's no way to read it."""
     if os.environ.get("GPU_WATTS"):
         return float(os.environ["GPU_WATTS"])
     try:
@@ -452,7 +453,27 @@ def gpu_watts() -> float:
                              capture_output=True, text=True, timeout=10).stdout.split()
         return float(out[0])
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
-        return 60.0  # a Mac, or no nvidia-smi
+        return None
+
+
+def gpu_watts() -> float:
+    """The GPU's power limit, for working out what a unit of work costs in electricity."""
+    return measured_watts() or 60.0  # a Mac, or no nvidia-smi
+
+
+def gpu_name(comfy_device: str | None = None) -> str | None:
+    """The card's name, so the broker can start this node at a floor that fits it: GPU_NAME, else what
+    ComfyUI reports ("cuda:0 NVIDIA GeForce RTX 4090 : cudaMallocAsync"), else nvidia-smi."""
+    if os.environ.get("GPU_NAME", "").strip():
+        return os.environ["GPU_NAME"].strip()[:80]
+    if comfy_device and comfy_device.startswith("cuda"):
+        return comfy_device.split(" : ")[0].split(" ", 1)[-1][:80]
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+        return out[0][:80] if out else None
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 class Floors:
@@ -533,7 +554,10 @@ async def worker(broker: httpx.AsyncClient, ollama: httpx.AsyncClient | None, co
 async def register(broker: httpx.AsyncClient, quiet: bool = False) -> None:
     paused = [m for m in MODELS if m.startswith("comfyui")] if GPU_STATE["paused"] else []
     free = shutil.disk_usage(COMFY_MODELS_DIR).free // 2 ** 20 if os.path.isdir(COMFY_MODELS_DIR) else None
-    info = {"presets": sorted(PRESETS), "fetches_models": FETCH_MODELS, "disk_free_mb": free}
+    info = {"presets": sorted(PRESETS), "fetches_models": FETCH_MODELS, "disk_free_mb": free,
+            # for the broker's starting floor on this card, until the node has timed its own jobs
+            "gpu": NODE["gpu"], "watts": measured_watts(), "kwh_price": KWH_PRICE, "price_set": bool(COMFY_PRICE_SET),
+            "learned": sorted(FLOORS.learned) if FLOORS else []}
     files = sorted(NODE["files"]) if NODE["files"] is not None else None
     r = await broker.post("/provider/register", json={"models": MODELS, "paused": paused, "files": files,
                                                       "vram_mb": NODE["vram_mb"], "info": info})
@@ -604,6 +628,10 @@ async def load_comfy(comfy: httpx.AsyncClient, broker: httpx.AsyncClient) -> Non
     """Decide what to offer: checkpoints/diffusion models (limited to COMFY_MODELS, or to what
     the chosen presets use), and which files to report."""
     files, vram = await prepare.inventory(comfy)
+    try:
+        NODE["gpu"] = gpu_name((await comfy.get("/system_stats")).json()["devices"][0].get("name"))
+    except (httpx.HTTPError, KeyError, IndexError, ValueError):
+        NODE["gpu"] = gpu_name()
     allowed, preset_files = set(COMFY_ONLY), set()
     if PRESETS:
         try:
