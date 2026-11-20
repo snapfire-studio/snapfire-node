@@ -1,0 +1,7 @@
+# written by setup.sh: holds this node's key
+.env
+broker.url.local
+models/
+*.part
+__pycache__/
+*.pyc

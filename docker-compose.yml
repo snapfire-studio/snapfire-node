@@ -1,0 +1,41 @@
+# A Snapfire node. Written for setup.sh, which fills in .env and picks what runs:
+#   worker    always: pulls tasks from the broker (it only dials out, no open ports)
+#   comfyui   profile "comfyui": image work, when ComfyUI should run in Docker
+#   ollama    profile "ollama":  text work, when Ollama should run in Docker
+# COMPOSE_PROFILES and COMPOSE_FILE in .env choose the profiles and the GPU file.
+name: snapfire-node
+
+services:
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    environment:
+      COMFY_MODELS_DIR: /models   # fetched models land in MODELS_DIR on the host
+      TOOLS_DIR: /tools
+    volumes:
+      - ${MODELS_DIR:-./models}:/models
+      - tools:/tools
+
+  comfyui:
+    profiles: [comfyui]
+    build:
+      context: .
+      dockerfile: comfyui.Dockerfile
+      args:
+        TORCH_INDEX: ${TORCH_INDEX:-}
+    restart: unless-stopped
+    command: sh -c "python main.py --listen 0.0.0.0 --port 8188 ${COMFY_ARGS:-}"
+    volumes:
+      - ${MODELS_DIR:-./models}:/comfyui/models
+
+  ollama:
+    profiles: [ollama]
+    image: ollama/ollama:0.40.16
+    restart: unless-stopped
+    volumes: [ollama:/root/.ollama]
+
+volumes:
+  ollama:
+  tools:
